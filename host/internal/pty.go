@@ -14,35 +14,35 @@ import (
 
 // 检查命令是否尝试访问项目外路径
 func checkCommand(cmd *exec.Cmd) error {
-	projectRoot := "d:\\upterm"
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get project root: %v", err)
+	}
+	projectRoot = filepath.Clean(projectRoot)
+
 	// 检查工作目录
 	if cmd.Dir != "" {
 		absDir, err := filepath.Abs(cmd.Dir)
 		if err != nil {
-			return fmt.Errorf("路径检查失败: %v", err)
+			return fmt.Errorf("invalid working directory: %v", err)
 		}
+		absDir = filepath.Clean(absDir)
 		if !strings.HasPrefix(absDir, projectRoot) {
-			return fmt.Errorf("禁止访问项目外目录: %s", absDir)
-		}
-	} else {
-		currentDir, err := os.Getwd()
-		if err != nil {
-			return fmt.Errorf("获取当前目录失败: %v", err)
-		}
-		if !strings.HasPrefix(currentDir, projectRoot) {
-			return fmt.Errorf("当前目录不在项目内: %s", currentDir)
+			return fmt.Errorf("access denied: working directory outside project root")
 		}
 	}
 
-	// 检查命令参数中的路径
+	// 仅检查看起来像路径的参数
 	for _, arg := range cmd.Args[1:] {
-		if strings.Contains(arg, "..") || strings.HasPrefix(arg, "/") || strings.HasPrefix(arg, "\\") {
+		if strings.Contains(arg, "..") || filepath.IsAbs(arg) {
 			absPath, err := filepath.Abs(arg)
 			if err != nil {
-				return fmt.Errorf("路径解析失败: %v", err)
+				continue // 忽略无效路径
 			}
+
+			absPath = filepath.Clean(absPath)
 			if !strings.HasPrefix(absPath, projectRoot) {
-				return fmt.Errorf("禁止访问项目外路径: %s", arg)
+				return fmt.Errorf("access denied: path outside project root: %s", arg)
 			}
 		}
 	}
@@ -63,9 +63,6 @@ func startPty(c *exec.Cmd) (*pty, error) {
 	return wrapPty(f), nil
 }
 
-// Linux kernel return EIO when attempting to read from a master pseudo
-// terminal which no longer has an open slave. So ignore error here.
-// See https://github.com/creack/pty/issues/21
 func ptyError(err error) error {
 	if pathErr, ok := err.(*os.PathError); !ok || pathErr.Err != syscall.EIO {
 		return err
@@ -82,11 +79,6 @@ func wrapPty(f *os.File) *pty {
 	return &pty{File: f}
 }
 
-// Pty is a wrapper of the pty *os.File that provides a read/write mutex.
-// This is to prevent data race that might happen for reszing, reading and closing.
-// See ftests failure:
-// * https://travis-ci.org/owenthereal/upterm/jobs/632489866
-// * https://travis-ci.org/owenthereal/upterm/jobs/632458125
 type pty struct {
 	*os.File
 	sync.RWMutex

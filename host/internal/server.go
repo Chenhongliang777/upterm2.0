@@ -3,13 +3,14 @@ package internal
 import (
 	"context"
 	"fmt"
-	"github.com/gen2brain/beeep"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/gen2brain/beeep"
 
 	gssh "github.com/charmbracelet/ssh"
 	"github.com/owenthereal/upterm/host/api"
@@ -165,30 +166,17 @@ type sessionHandler struct {
 	readonly          bool
 }
 
-// judge a command is dangerous or not
 func isDangerousCommand(command string) bool {
-	if strings.HasPrefix(strings.TrimSpace(command), "rm") {
-		return true
-	}
-	if strings.HasPrefix(strings.TrimSpace(command), "sudo rm") {
-		return true
-	}
-	return false
+	command = strings.TrimSpace(command)
+	return strings.HasPrefix(command, "rm") ||
+		strings.HasPrefix(command, "sudo rm")
 }
 
-// judge a command is warning or not
 func isWarningCommand(command string) bool {
-	if strings.HasPrefix(strings.TrimSpace(command), "sudo") {
-		return true
-	}
-	if strings.HasPrefix(strings.TrimSpace(command), "mv") {
-		return true
-	}
-	if strings.HasPrefix(strings.TrimSpace(command), "cp") {
-		return true
-	}
-
-	return false
+	command = strings.TrimSpace(command)
+	return strings.HasPrefix(command, "sudo") ||
+		strings.HasPrefix(command, "mv") ||
+		strings.HasPrefix(command, "cp")
 }
 
 func (h *sessionHandler) HandleSession(sess gssh.Session) {
@@ -297,13 +285,9 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 		// input
 		ctx, cancel := context.WithCancel(h.ctx)
 		g.Add(func() error {
-			// previous
-			//_, err := io.Copy(ptmx, uio.NewContextReader(ctx, sess))
-			//return err
-
-			// new
 			reader := uio.NewContextReader(ctx, sess)
-			var currentCommand string
+			var currentCommand strings.Builder
+
 			for {
 				buf := make([]byte, 1024)
 				n, err := reader.Read(buf)
@@ -311,62 +295,87 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 					return err
 				}
 
-				input := string(buf[:n])
+				// 1. 首先检查输入中是否包含危险命令
+				shouldBlock := false
+				for i := 0; i < n; i++ {
+					b := buf[i]
 
-				if strings.Contains(input, "\x7f") && len(currentCommand) > 0 {
-					// if input is backspace, remove the last character from the current command
-					currentCommand = currentCommand[:len(currentCommand)-1]
-				} else if strings.Contains(input, "\x03") {
-					// if input is ctrl + c, clear the current command
-					currentCommand = ""
-				} else if strings.Contains(input, "\r") || strings.Contains(input, "\n") {
-					// if the input is \r or \n, the current command is complete
-					if isDangerousCommand(currentCommand) {
-						// press ctrl + c
-						_, err = ptmx.Write([]byte{3})
-						if err != nil {
-							return err
+					switch {
+					case b == 0x03: // Ctrl+C
+						currentCommand.Reset()
+
+					case b == 0x7F: // Backspace
+						if currentCommand.Len() > 0 {
+							s := currentCommand.String()
+							currentCommand.Reset()
+							currentCommand.WriteString(s[:len(s)-1])
 						}
 
-						// write to client to notify them that they have tried to run a dangerous command
-						_, _ = io.WriteString(sess, "\r\nDanger"+
-							"\r\nYou have attempted to execute a dangerous command: "+currentCommand+
-							"\r\nThis command has been forbidden.\r\n")
+					case b == '\r' || b == '\n': // Enter
+						cmdStr := currentCommand.String()
+						currentCommand.Reset()
 
-						// beeep
-						_ = beeep.Notify("Danger", "The collaborator has tried to run a dangerous command: "+currentCommand+". This command has been forbidden.", "")
+						if cmdStr != "" {
+							if isDangerousCommand(cmdStr) {
+								shouldBlock = true
 
-						// reset current command
-						currentCommand = ""
+								// 准备警告消息
+								msg := fmt.Sprintf(
+									"\r\n\x1b[31mDANGER: Blocked dangerous command\x1b[0m\r\n"+
+										"Command: %s\r\n"+
+										"Reason: This command is forbidden for security reasons\r\n\r\n",
+									cmdStr,
+								)
 
-						continue
-					} else if isWarningCommand(currentCommand) {
-						_, err = ptmx.Write(buf[:n])
+								// 发送警告消息给客户端
+								if _, err := sess.Write([]byte(msg)); err != nil {
+									return err
+								}
 
-						// write to client to notify them that they have tried to run a warning command
-						_, _ = io.WriteString(sess, "\r\nWarning"+
-							"\r\nYou have attempted to execute a risky command: "+currentCommand+
-							"\r\nThis command will not be forbidden, but please be careful when executing it.\r\n")
+								// 发送系统通知
+								_ = beeep.Notify(
+									"Security Alert",
+									fmt.Sprintf("Blocked dangerous command: %s", cmdStr),
+									"",
+								)
 
-						// beeep
-						_ = beeep.Notify("Warning", "The collaborator has tried to run a risky command: "+currentCommand+". This command will not be forbidden, but please be careful when executing it.", "")
+							} else if isWarningCommand(cmdStr) {
+								// 发送警告消息（不中断命令）
+								msg := fmt.Sprintf(
+									"\r\n\x1b[33mWARNING: Risky command\x1b[0m\r\n"+
+										"Command: %s\r\n"+
+										"Note: Proceed with caution\r\n\r\n",
+									cmdStr,
+								)
+								if _, err := sess.Write([]byte(msg)); err != nil {
+									return err
+								}
 
-						// reset current command
-						currentCommand = ""
+								// 发送系统通知
+								_ = beeep.Notify(
+									"Security Warning",
+									fmt.Sprintf("Risky command executed: %s", cmdStr),
+									"",
+								)
+							}
+						}
 
-						continue
+					case b >= 0x20 && b <= 0x7E: // 可打印字符
+						currentCommand.WriteByte(b)
 					}
-
-					// reset current command
-					currentCommand = ""
-				} else {
-					// otherwise, add the input to the current command
-					currentCommand += input
 				}
 
-				_, err = ptmx.Write(buf[:n])
-				if err != nil {
-					return err
+				// 2. 根据检查结果决定是否写入终端
+				if shouldBlock {
+					// 对于危险命令：发送Ctrl+C中断命令
+					if _, err := ptmx.Write([]byte{3}); err != nil {
+						return err
+					}
+				} else {
+					// 对于安全命令：正常写入终端
+					if _, err := ptmx.Write(buf[:n]); err != nil {
+						return err
+					}
 				}
 			}
 		}, func(err error) {
@@ -400,16 +409,18 @@ func emitClientLeftEvent(eventEmmiter *emitter.Emitter, sessionID string) {
 }
 
 func startAttachCmd(ctx context.Context, c []string, term string) (*exec.Cmd, *pty, error) {
-	projectRoot, err := os.Getwd()
-    if err != nil {
-        return nil, nil, fmt.Errorf("failed to get project root: %v", err)
-    }
-    if err := ValidateCommand(c[0], c[1:], projectRoot); err != nil {
-        return nil, nil, fmt.Errorf("command validation failed: %v", err)
-    }
-    cmd := exec.CommandContext(ctx, c[0], c[1:]...)
+	cmd := exec.CommandContext(ctx, c[0], c[1:]...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("TERM=%s", term))
-	pty, err := startPty(cmd)
 
+	wd, err := os.Getwd()
+	if err == nil {
+		cmd.Dir = wd
+	}
+
+	if err := checkCommand(cmd); err != nil {
+		return nil, nil, fmt.Errorf("command validation failed: %v", err)
+	}
+
+	pty, err := startPty(cmd)
 	return cmd, pty, err
 }
