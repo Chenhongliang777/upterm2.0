@@ -1,0 +1,51 @@
+app = "upterm"
+kill_signal = "SIGINT"
+kill_timeout = "5s"
+
+[build]
+dockerfile = "Dockerfile.uptermd"
+build-target = "uptermd-fly"
+
+[experimental]
+entrypoint = ["uptermd-fly"]
+
+[[services]]
+protocol = "tcp"
+internal_port = 2222
+auto_stop_machines = false
+auto_start_machines = true
+min_machines_running = 3
+processes = ["app"]
+
+[[services.ports]]
+port = 22
+[services.concurrency]
+type = "connections"
+hard_limit = 2500
+soft_limit = 2000
+
+[[services.tcp_checks]]
+interval = "15s"
+timeout = "2s"
+grace_period = "5s"
+
+[[services]]
+protocol = "tcp"
+internal_port = 8090
+auto_stop_machines = false
+auto_start_machines = true
+min_machines_running = 3
+processes = ["app"]
+
+[[services.ports]]
+port = 80
+handlers = ["http"]
+force_https = true
+
+[[services.ports]]
+port = 443
+handlers = ["tls", "http"]
+[services.concurrency]
+type = "connections"
+hard_limit = 2500
+soft_limit = 2000

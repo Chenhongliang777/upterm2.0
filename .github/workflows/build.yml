@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+
+jobs:
+  build:
+    name: Compile
+    runs-on: ${{ matrix.os  }}
+    strategy:
+      matrix:
+        os: [ macos-latest, ubuntu-latest ]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        check-latest: true
+    - name: Compile
+      run: make install
+  test:
+    name: Test
+    runs-on: ${{ matrix.os  }}
+    strategy:
+      matrix:
+        os: [ macos-latest, ubuntu-latest ]
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+        check-latest: true
+    - name: Test
+      run: make test
+      env:
+        BASH_SILENCE_DEPRECATION_WARNING: 1 # See https://www.loekvandenouweland.com/content/the-default-interactive-shell-is-now-zsh.html
+        MUTE_FLAKY_TESTS: 1
+  vet:
+    name: Vet
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out code into the Go module directory
+      uses: actions/checkout@v4
+    - name: Vet
+      run: make vet
+  docker:
+      name: Docker
+      needs: [build, test, vet]
+      uses: ./.github/workflows/docker.yaml
+      secrets: inherit
