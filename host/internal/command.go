@@ -56,16 +56,15 @@ type command struct {
 func (c *command) Start(ctx context.Context) (*pty, error) {
 	c.ctx = ctx
 	projectRoot, err := os.Getwd()
-    if err != nil {
-        return nil, fmt.Errorf("failed to get project root: %v", err)
-    }
-    if err := ValidateCommand(c.name, c.args, projectRoot); err != nil {
-        return nil, fmt.Errorf("command validation failed: %v", err)
-    }
-    c.cmd = exec.CommandContext(ctx, c.name, c.args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get project root: %v", err)
+	}
+	if err := ValidateCommand(c.name, c.args, projectRoot); err != nil {
+		return nil, fmt.Errorf("command validation failed: %v", err)
+	}
+	c.cmd = exec.CommandContext(ctx, c.name, c.args...)
 	c.cmd.Env = append(c.env, os.Environ()...)
 
-	var err error
 	c.ptmx, err = startPty(c.cmd)
 	if err != nil {
 		return nil, fmt.Errorf("unable to start pty: %w", err)
