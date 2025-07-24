@@ -225,7 +225,8 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 			for {
 				select {
 				case <-ticker.C:
-					_, _, err := sess.SendRequest(upterm.OpenSSHKeepAliveRequestType, true, nil)
+					// 修复: SendRequest 只返回2个值
+					_, err := sess.SendRequest(upterm.OpenSSHKeepAliveRequestType, true, nil)
 					if err != nil {
 						h.logger.WithError(err).Debug("error sending keepalive")
 					}
@@ -326,8 +327,12 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 						currentLine.Reset()
 						processed = append(processed, b)
 					case 0x7F: // Backspace
+						// 修复: 使用正确的方法处理 Backspace
 						if currentLine.Len() > 0 {
-							currentLine.Truncate(currentLine.Len() - 1)
+							// 删除最后一个字符
+							str := currentLine.String()
+							currentLine.Reset()
+							currentLine.WriteString(str[:len(str)-1])
 						}
 						processed = append(processed, b)
 					case '\r', '\n':
