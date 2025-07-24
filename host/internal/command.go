@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/oklog/run"
@@ -53,13 +55,42 @@ type command struct {
 	ctx context.Context
 }
 
+// 在文件顶部添加路径验证函数
+func isPathInProject(path, projectRoot string) bool {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+
+	absProject, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return false
+	}
+
+	return strings.HasPrefix(absPath, absProject)
+}
+
 func (c *command) Start(ctx context.Context) (*pty, error) {
 	c.ctx = ctx
+
+	// 获取项目根目录
+	projectRoot, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get project root: %v", err)
+	}
+
+	// 验证命令参数中的路径
+	for _, arg := range c.args {
+		if strings.Contains(arg, "/") || strings.Contains(arg, "..") {
+			if !isPathInProject(arg, projectRoot) {
+				return nil, fmt.Errorf("command argument references external path: %s", arg)
+			}
+		}
+	}
 
 	c.cmd = exec.CommandContext(ctx, c.name, c.args...)
 	c.cmd.Env = append(c.env, os.Environ()...)
 
-	var err error
 	c.ptmx, err = startPty(c.cmd)
 	if err != nil {
 		return nil, fmt.Errorf("unable to start pty: %w", err)

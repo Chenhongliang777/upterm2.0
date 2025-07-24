@@ -13,12 +13,9 @@ func NewClientRepo() *ClientRepo {
 
 type ClientRepo struct {
 	clients sync.Map
-	mu      sync.Mutex
 }
 
 func (c *ClientRepo) Add(client *api.Client) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	_, loaded := c.clients.LoadOrStore(client.Id, client)
 	if loaded {
 		return fmt.Errorf("client already exists")
