@@ -10,9 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gen2brain/beeep"
-
 	gssh "github.com/charmbracelet/ssh"
+	"github.com/gen2brain/beeep"
 	"github.com/owenthereal/upterm/host/api"
 	"github.com/owenthereal/upterm/server"
 	"github.com/owenthereal/upterm/upterm"
@@ -24,6 +23,38 @@ import (
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/crypto/ssh"
 )
+
+// ------------------ 危险/警告命令黑名单 ------------------
+var dangerList = []string{
+	"rm", "sudo rm", "dd", "mkfs", "shutdown", "reboot", "halt", "poweroff",
+	"wget", "curl", "nc", "ncat", "python", "perl", "ruby", "node",
+}
+
+var warnList = []string{
+	"sudo", "mv", "cp", "chmod", "chown", "passwd", "visudo",
+}
+
+func isDangerousCommand(cmd string) bool {
+	cmd = strings.TrimSpace(strings.ToLower(cmd))
+	for _, d := range dangerList {
+		if strings.HasPrefix(cmd, d) {
+			return true
+		}
+	}
+	return false
+}
+
+func isWarningCommand(cmd string) bool {
+	cmd = strings.TrimSpace(strings.ToLower(cmd))
+	for _, w := range warnList {
+		if strings.HasPrefix(cmd, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// --------------------------------------------------------
 
 type Server struct {
 	Command           []string
@@ -40,6 +71,15 @@ type Server struct {
 }
 
 func (s *Server) ServeWithContext(ctx context.Context, l net.Listener) error {
+	// 1. 锁定工作目录为当前目录
+	wd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cannot get working dir: %w", err)
+	}
+	lockCmd := []string{"bash", "--norc", "--noprofile", "-c", "cd " + wd + " && exec bash"}
+	s.Command = lockCmd
+	s.ForceCommand = lockCmd
+
 	writers := uio.NewMultiWriter(5)
 
 	cmdCtx, cmdCancel := context.WithCancel(ctx)
@@ -101,7 +141,7 @@ func (s *Server) ServeWithContext(ctx context.Context, l net.Listener) error {
 			ss = append(ss, signer)
 		}
 
-		server := gssh.Server{
+		srv := gssh.Server{
 			HostSigners:      ss,
 			Handler:          sh.HandleSession,
 			Version:          upterm.HostSSHServerVersion,
@@ -111,12 +151,10 @@ func (s *Server) ServeWithContext(ctx context.Context, l net.Listener) error {
 			},
 		}
 		g.Add(func() error {
-			return server.Serve(l)
+			return srv.Serve(l)
 		}, func(err error) {
-			// kill ssh sessionHandler
 			cancel()
-			// shut down ssh server
-			_ = server.Shutdown(ctx)
+			_ = srv.Shutdown(ctx)
 		})
 	}
 
@@ -137,20 +175,16 @@ func (h *publicKeyHandler) HandlePublicKey(ctx gssh.Context, key gssh.PublicKey)
 		return false
 	}
 
-	// TODO: sshproxy already rejects unauthorized keys
-	// Does host still need to check them?
 	if len(h.AuthorizedKeys) == 0 {
 		emitClientJoinEvent(h.EventEmmiter, ctx.SessionID(), auth, pk)
 		return true
 	}
-
 	for _, k := range h.AuthorizedKeys {
 		if utils.KeysEqual(k, pk) {
 			emitClientJoinEvent(h.EventEmmiter, ctx.SessionID(), auth, pk)
 			return true
 		}
 	}
-
 	h.Logger.Info("unauthorized public key")
 	return false
 }
@@ -166,19 +200,6 @@ type sessionHandler struct {
 	readonly          bool
 }
 
-func isDangerousCommand(command string) bool {
-	command = strings.TrimSpace(command)
-	return strings.HasPrefix(command, "rm") ||
-		strings.HasPrefix(command, "sudo rm")
-}
-
-func isWarningCommand(command string) bool {
-	command = strings.TrimSpace(command)
-	return strings.HasPrefix(command, "sudo") ||
-		strings.HasPrefix(command, "mv") ||
-		strings.HasPrefix(command, "cp")
-}
-
 func (h *sessionHandler) HandleSession(sess gssh.Session) {
 	sessionID := sess.Context().Value(gssh.ContextKeySessionID).(string)
 	defer emitClientLeftEvent(h.eventEmmiter, sessionID)
@@ -187,26 +208,26 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 	if !isPty {
 		_, _ = io.WriteString(sess, "PTY is required.\n")
 		_ = sess.Exit(1)
+		return
 	}
 
 	var (
 		g    run.Group
-		err  error
 		ptmx = h.ptmx
 	)
 
-	// simulate openssh keepalive
+	// keep-alive
 	{
 		ctx, cancel := context.WithCancel(h.ctx)
 		g.Add(func() error {
 			ticker := time.NewTicker(h.keepAliveDuration)
 			defer ticker.Stop()
-
 			for {
 				select {
 				case <-ticker.C:
-					if _, err := sess.SendRequest(upterm.OpenSSHKeepAliveRequestType, true, nil); err != nil {
-						h.logger.WithError(err).Debug("error pinging client to keepalive")
+					_, _, err := sess.SendRequest(upterm.OpenSSHKeepAliveRequestType, true, nil)
+					if err != nil {
+						h.logger.WithError(err).Debug("error sending keepalive")
 					}
 				case <-ctx.Done():
 					return ctx.Err()
@@ -218,48 +239,41 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 	}
 
 	if len(h.forceCommand) > 0 {
-		var cmd *exec.Cmd
-
 		ctx, cancel := context.WithCancel(h.ctx)
 		defer cancel()
 
-		cmd, ptmx, err = startAttachCmd(ctx, h.forceCommand, ptyReq.Term)
+		cmd, newPty, err := startAttachCmd(ctx, h.forceCommand, ptyReq.Term)
 		if err != nil {
-			h.logger.WithError(err).Error("error starting force command")
+			h.logger.WithError(err).Error("start force command failed")
 			_ = sess.Exit(1)
 			return
 		}
+		ptmx = newPty
 
-		{
-			// reattach output
-			g.Add(func() error {
-				_, err := io.Copy(sess, uio.NewContextReader(ctx, ptmx))
-				return ptyError(err)
-			}, func(err error) {
-				cancel()
-				ptmx.Close()
-			})
-		}
-		{
-			g.Add(func() error {
-				return cmd.Wait()
-			}, func(err error) {
-				cancel()
-				ptmx.Close()
-			})
-		}
+		g.Add(func() error {
+			_, err := io.Copy(sess, uio.NewContextReader(ctx, ptmx))
+			return ptyError(err)
+		}, func(err error) {
+			cancel()
+			ptmx.Close()
+		})
+
+		g.Add(func() error {
+			return cmd.Wait()
+		}, func(err error) {
+			cancel()
+			ptmx.Close()
+		})
 	} else {
-		// output
 		if err := h.writers.Append(sess); err != nil {
 			_ = sess.Exit(1)
 			return
 		}
-
 		defer h.writers.Remove(sess)
 	}
 
+	// window resize
 	{
-		// pty
 		ctx, cancel := context.WithCancel(h.ctx)
 		tee := terminalEventEmitter{h.eventEmmiter}
 		g.Add(func() error {
@@ -277,16 +291,13 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 		})
 	}
 
-	// if a readonly session has been requested, don't connect stdin
-	if h.readonly {
-		// write to client to notify them that they have connected to a read-only session
-		_, _ = io.WriteString(sess, "\r\n=== Attached to read-only session ===\r\n\r\n")
-	} else {
-		// input
+	// -------------- 输入过滤 --------------
+	if !h.readonly {
 		ctx, cancel := context.WithCancel(h.ctx)
 		g.Add(func() error {
 			reader := uio.NewContextReader(ctx, sess)
-			var currentCommand strings.Builder
+			var currentLine strings.Builder
+			var inEscape bool
 
 			for {
 				buf := make([]byte, 1024)
@@ -295,87 +306,67 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 					return err
 				}
 
-				// 1. 首先检查输入中是否包含危险命令
-				shouldBlock := false
+				// 处理读取到的数据
+				processed := make([]byte, 0, n)
 				for i := 0; i < n; i++ {
 					b := buf[i]
 
-					switch {
-					case b == 0x03: // Ctrl+C
-						currentCommand.Reset()
-
-					case b == 0x7F: // Backspace
-						if currentCommand.Len() > 0 {
-							s := currentCommand.String()
-							currentCommand.Reset()
-							currentCommand.WriteString(s[:len(s)-1])
+					// 处理转义序列
+					if inEscape {
+						// 简单的转义序列处理 - 假设转义序列最多3个字符
+						if b >= 0x40 && b <= 0x7E { // 转义序列结束
+							inEscape = false
 						}
+						processed = append(processed, b)
+						continue
+					}
 
-					case b == '\r' || b == '\n': // Enter
-						cmdStr := currentCommand.String()
-						currentCommand.Reset()
+					switch b {
+					case 0x03: // Ctrl+C
+						currentLine.Reset()
+						processed = append(processed, b)
+					case 0x7F: // Backspace
+						if currentLine.Len() > 0 {
+							currentLine.Truncate(currentLine.Len() - 1)
+						}
+						processed = append(processed, b)
+					case '\r', '\n':
+						line := currentLine.String()
+						currentLine.Reset()
 
-						if cmdStr != "" {
-							if isDangerousCommand(cmdStr) {
-								shouldBlock = true
-
-								// 准备警告消息
-								msg := fmt.Sprintf(
-									"\r\n\x1b[31mDANGER: Blocked dangerous command\x1b[0m\r\n"+
-										"Command: %s\r\n"+
-										"Reason: This command is forbidden for security reasons\r\n\r\n",
-									cmdStr,
-								)
-
-								// 发送警告消息给客户端
-								if _, err := sess.Write([]byte(msg)); err != nil {
-									return err
-								}
-
-								// 发送系统通知
-								_ = beeep.Notify(
-									"Security Alert",
-									fmt.Sprintf("Blocked dangerous command: %s", cmdStr),
-									"",
-								)
-
-							} else if isWarningCommand(cmdStr) {
-								// 发送警告消息（不中断命令）
-								msg := fmt.Sprintf(
-									"\r\n\x1b[33mWARNING: Risky command\x1b[0m\r\n"+
-										"Command: %s\r\n"+
-										"Note: Proceed with caution\r\n\r\n",
-									cmdStr,
-								)
-								if _, err := sess.Write([]byte(msg)); err != nil {
-									return err
-								}
-
-								// 发送系统通知
-								_ = beeep.Notify(
-									"Security Warning",
-									fmt.Sprintf("Risky command executed: %s", cmdStr),
-									"",
-								)
+						if isDangerousCommand(line) {
+							// 发送Ctrl+C中断命令
+							processed = append(processed, 0x03)
+							// 显示警告消息
+							warning := fmt.Sprintf("\r\n\x1b[31mSECURITY ALERT: Blocked dangerous command\x1b[0m\r\nCommand: %s\r\n\r\n", line)
+							if _, err := sess.Write([]byte(warning)); err != nil {
+								return err
 							}
+							_ = beeep.Notify("Security Alert", "Blocked: "+line, "")
+						} else if isWarningCommand(line) {
+							warning := fmt.Sprintf("\r\n\x1b[33mSECURITY WARNING: Risky command detected\x1b[0m\r\nCommand: %s\r\n\r\n", line)
+							if _, err := sess.Write([]byte(warning)); err != nil {
+								return err
+							}
+							_ = beeep.Notify("Security Warning", "Warning: "+line, "")
+							processed = append(processed, b)
+						} else {
+							processed = append(processed, b)
 						}
-
-					case b >= 0x20 && b <= 0x7E: // 可打印字符
-						currentCommand.WriteByte(b)
+					case 0x1B: // ESC - 转义序列开始
+						inEscape = true
+						processed = append(processed, b)
+					default:
+						if b >= 0x20 && b <= 0x7E {
+							currentLine.WriteByte(b)
+						}
+						processed = append(processed, b)
 					}
 				}
 
-				// 2. 根据检查结果决定是否写入终端
-				if shouldBlock {
-					// 对于危险命令：发送Ctrl+C中断命令
-					if _, err := ptmx.Write([]byte{3}); err != nil {
-						return err
-					}
-				} else {
-					// 对于安全命令：正常写入终端
-					if _, err := ptmx.Write(buf[:n]); err != nil {
-						return err
-					}
+				// 将处理后的数据写入ptmx
+				if _, err := ptmx.Write(processed); err != nil {
+					return err
 				}
 			}
 		}, func(err error) {
@@ -394,33 +385,22 @@ func (h *sessionHandler) HandleSession(sess gssh.Session) {
 	}
 }
 
-func emitClientJoinEvent(eventEmmiter *emitter.Emitter, sessionID string, auth *server.AuthRequest, pk ssh.PublicKey) {
-	c := &api.Client{
-		Id:                   sessionID,
+func emitClientJoinEvent(e *emitter.Emitter, sid string, auth *server.AuthRequest, pk ssh.PublicKey) {
+	e.Emit(upterm.EventClientJoined, &api.Client{
+		Id:                   sid,
 		Version:              auth.ClientVersion,
 		Addr:                 auth.RemoteAddr,
 		PublicKeyFingerprint: utils.FingerprintSHA256(pk),
-	}
-	eventEmmiter.Emit(upterm.EventClientJoined, c)
+	})
 }
 
-func emitClientLeftEvent(eventEmmiter *emitter.Emitter, sessionID string) {
-	eventEmmiter.Emit(upterm.EventClientLeft, sessionID)
+func emitClientLeftEvent(e *emitter.Emitter, sid string) {
+	e.Emit(upterm.EventClientLeft, sid)
 }
 
 func startAttachCmd(ctx context.Context, c []string, term string) (*exec.Cmd, *pty, error) {
 	cmd := exec.CommandContext(ctx, c[0], c[1:]...)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("TERM=%s", term))
-
-	wd, err := os.Getwd()
-	if err == nil {
-		cmd.Dir = wd
-	}
-
-	if err := checkCommand(cmd); err != nil {
-		return nil, nil, fmt.Errorf("command validation failed: %v", err)
-	}
-
+	cmd.Env = append(os.Environ(), "TERM="+term)
 	pty, err := startPty(cmd)
 	return cmd, pty, err
 }
